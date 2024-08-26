@@ -1,38 +1,41 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.22;
 
-import { Ownable } from "@openzeppelin/contracts/access/Ownable.sol";
-import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
+import { OApp, MessagingFee, Origin } from "@layerzerolabs/oapp-evm/contracts/oapp/OApp.sol";
 
-contract OmniVote is Ownable {
+contract OmniVote is OApp {
     using ECDSA for bytes32;
 
-    // Structure to hold DAO information
+    uint256 public creationFee;
     struct DAOInfo {
         address daoAddress;
         string name;
         string description;
-        string ipfsMetadataHash; // IPFS hash for storing metadata like proposal descriptions, images, etc.
+        string ipfsMetadataHash;
+        address tokenAddress;
+        uint256 minimumTokens;
     }
 
-    // Proposal structure
     struct Proposal {
         string description;
         uint256 startTime;
         uint256 endTime;
         uint256 quorum;
+        mapping(address => uint256) votes;
         uint256 totalVotes;
-        mapping(address => bool) voters; // To track who has voted
-        mapping(uint256 => uint256) options; // Voting options and their vote counts
     }
 
-    // DAO and Proposal Storage
     mapping(bytes32 => DAOInfo) public daos;
     mapping(bytes32 => Proposal) public proposals;
+    mapping(address => bool) public whitelistedUsers;
 
-    address public admin; // Admin of the Omnivote contract
+    event CreationFeeUpdated(uint256 newFee);
+    event DaoAdded(bytes32 indexed daoId, address indexed daoCreator, string name, string description);
 
-    event DaoAdded(bytes32 indexed daoId, address daoAddress, string name, string description, string ipfsMetadataHash);
+    event MinimumTokensUpdated(bytes32 indexed daoId, uint256 newMinimum);
     event ProposalCreated(
         bytes32 indexed daoId,
         bytes32 indexed proposalId,
@@ -41,52 +44,51 @@ contract OmniVote is Ownable {
         uint256 endTime,
         uint256 quorum
     );
-    event VoteSubmitted(address indexed voter, bytes32 indexed proposalId, uint256 option, uint256 weight);
-    event ProposalFinalized(bytes32 indexed proposalId, uint256[] results);
-    modifier onlyAdmin() {
-        require(msg.sender == admin, "Not admin");
-        _;
+    event VoteSubmitted(address indexed voter, bytes32 indexed proposalId, uint256 weight);
+    event ProposalFinalized(bytes32 indexed proposalId);
+
+    constructor(
+        address _endpoint,
+        address _delegate,
+        uint256 initialCreationFee
+    ) OApp(_endpoint, _delegate) Ownable(_delegate) {
+        creationFee = initialCreationFee; // Set the initial creation fee
     }
 
-    modifier onlyDAOOwner(address _daoAddress) {
-        // Implement a way to verify DAO ownership, this is a placeholder
-        require(msg.sender == _daoAddress, "Not DAO owner");
-        _;
+    function setCreationFee(uint256 newFee) external onlyOwner {
+        creationFee = newFee;
+        emit CreationFeeUpdated(newFee);
     }
 
-    constructor() Ownable() {}
-
-    /**
-     * @notice Adds a new DAO to the OmniVote contract.
-     * @param _daoId Unique identifier for the DAO.
-     * @param _daoAddress The address of the DAO contract.
-     * @param _name The name of the DAO.
-     * @param _description A brief description of the DAO.
-     * @param _ipfsMetadataHash IPFS hash containing DAO metadata.
-     */
     function addDao(
         bytes32 _daoId,
-        address _daoAddress,
         string memory _name,
         string memory _description,
-        string memory _ipfsMetadataHash
-    ) external onlyOwner {
-        require(_daoAddress != address(0), "Invalid DAO address");
-        require(daos[_daoId].daoAddress == address(0), "DAO already exists");
+        string memory _ipfsMetadataHash,
+        address _tokenAddress,
+        uint256 _minimumTokens
+    ) public payable {
+        require(msg.value >= creationFee, "Creation fee not met");
+        require(daos[_daoId].daoAddress == address(0), "DAO ID already in use");
 
-        daos[_daoId] = DAOInfo(_daoAddress, _name, _description, _ipfsMetadataHash);
-        emit DaoAdded(_daoId, _daoAddress, _name, _description, _ipfsMetadataHash);
+        // DAO creation logic
+        daos[_daoId] = DAOInfo({
+            daoAddress: msg.sender,
+            name: _name,
+            description: _description,
+            ipfsMetadataHash: _ipfsMetadataHash,
+            tokenAddress: _tokenAddress,
+            minimumTokens: _minimumTokens
+        });
+        emit DaoAdded(_daoId, msg.sender, _name, _description);
     }
 
-    /**
-     * @notice Creates a new proposal in the specified DAO.
-     * @param _daoId The identifier of the DAO.
-     * @param _proposalId The identifier of the proposal.
-     * @param _description Description of the proposal.
-     * @param _startTime Start time of the proposal voting period.
-     * @param _endTime End time of the proposal voting period.
-     * @param _quorum Minimum number of votes required for the proposal to be valid.
-     */
+    function updateMinimumTokens(bytes32 _daoId, uint256 _newMinimum) external {
+        require(msg.sender == daos[_daoId].daoAddress, "Unauthorized");
+        daos[_daoId].minimumTokens = _newMinimum;
+        emit MinimumTokensUpdated(_daoId, _newMinimum);
+    }
+
     function createProposal(
         bytes32 _daoId,
         bytes32 _proposalId,
@@ -94,10 +96,11 @@ contract OmniVote is Ownable {
         uint256 _startTime,
         uint256 _endTime,
         uint256 _quorum
-    ) external onlyOwner {
+    ) external {
+        require(msg.sender == daos[_daoId].daoAddress, "Unauthorized");
         require(daos[_daoId].daoAddress != address(0), "DAO does not exist");
-        require(_startTime < _endTime, "Invalid time range");
-
+        require(proposals[_proposalId].startTime == 0, "Proposal already exists"); // Ensuring not to overwrite existing proposal
+        // Initialize each field of the struct individually
         Proposal storage proposal = proposals[_proposalId];
         proposal.description = _description;
         proposal.startTime = _startTime;
@@ -107,61 +110,30 @@ contract OmniVote is Ownable {
         emit ProposalCreated(_daoId, _proposalId, _description, _startTime, _endTime, _quorum);
     }
 
-    /**
-     * @notice Allows users to submit an off-chain vote.
-     * @param _proposalId The ID of the proposal being voted on.
-     * @param _option The voting option chosen by the user.
-     * @param _weight The weight of the user's vote (e.g., number of tokens).
-     * @param _signature The off-chain signature of the voter's address and vote details.
-     */
-    function submitVote(bytes32 _proposalId, uint256 _option, uint256 _weight, bytes memory _signature) external {
+    function submitVote(bytes32 _proposalId, uint256 _weight) external {
+        require(whitelistedUsers[msg.sender], "User not whitelisted");
         Proposal storage proposal = proposals[_proposalId];
+        require(block.timestamp >= proposal.startTime && block.timestamp <= proposal.endTime, "Voting not active");
+
+        bytes32 daoId = findDaoIdByProposal(_proposalId);
         require(
-            block.timestamp >= proposal.startTime && block.timestamp <= proposal.endTime,
-            "Voting period not active"
+            IERC20(daos[daoId].tokenAddress).balanceOf(msg.sender) >= daos[daoId].minimumTokens,
+            "Insufficient tokens"
         );
-        require(!proposal.voters[msg.sender], "Already voted");
 
-        // Verify off-chain signature
-        bytes32 messageHash = keccak256(abi.encodePacked(msg.sender, _proposalId, _option, _weight));
-        address signer = messageHash.toEthSignedMessageHash().recover(_signature);
-        require(signer == msg.sender, "Invalid signature");
-
-        proposal.voters[msg.sender] = true;
-        proposal.options[_option] += _weight;
+        proposal.votes[msg.sender] += _weight;
         proposal.totalVotes += _weight;
-
-        emit VoteSubmitted(msg.sender, _proposalId, _option, _weight);
+        emit VoteSubmitted(msg.sender, _proposalId, _weight);
     }
 
-    /**
-     * @notice Finalizes a proposal and calculates the results.
-     * @param _proposalId The ID of the proposal to finalize.
-     */
-    function finalizeProposal(bytes32 _proposalId) external onlyOwner {
+    function finalizeProposal(bytes32 _proposalId) external {
+        bytes32 daoId = findDaoIdByProposal(_proposalId);
+        require(msg.sender == daos[daoId].daoAddress, "Unauthorized");
         Proposal storage proposal = proposals[_proposalId];
         require(block.timestamp > proposal.endTime, "Voting period not yet ended");
-
-        uint256[] memory results = new uint256[](proposal.totalVotes);
-        uint256 resultCount = 0;
-
-        for (uint256 i = 0; i < proposal.totalVotes; i++) {
-            results[i] = proposal.options[i];
-            resultCount++;
-        }
-
-        emit ProposalFinalized(_proposalId, results);
+        emit ProposalFinalized(_proposalId);
     }
 
-    /**
-     * @notice Returns the details of a proposal.
-     * @param _proposalId The ID of the proposal.
-     * @return description The description of the proposal.
-     * @return startTime Start time of the proposal voting period.
-     * @return endTime End time of the proposal voting period.
-     * @return quorum Minimum number of votes required for the proposal to be valid.
-     * @return totalVotes Total votes cast for the proposal.
-     */
     function getProposalDetails(
         bytes32 _proposalId
     )
@@ -171,5 +143,11 @@ contract OmniVote is Ownable {
     {
         Proposal storage proposal = proposals[_proposalId];
         return (proposal.description, proposal.startTime, proposal.endTime, proposal.quorum, proposal.totalVotes);
+    }
+
+    // Utility function to find the DAO ID from a proposal ID
+    function findDaoIdByProposal(bytes32 _proposalId) private view returns (bytes32) {
+        // Simplified; assume DAO ID is directly obtainable or derive logic to map it correctly
+        return bytes32(0); // Placeholder logic
     }
 }
